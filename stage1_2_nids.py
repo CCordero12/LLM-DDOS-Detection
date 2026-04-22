@@ -7,7 +7,6 @@ Stage 2: Train Random Forest & XGBoost Classifiers
 """
 
 import os
-import glob
 import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
@@ -32,18 +31,10 @@ from xgboost import XGBClassifier
 # CONFIGURATION — edit these paths to match your setup
 # =============================================================
 
-DATA_DIR = r"C:\Users\Admin\Documents\Cybersecurity_final\data"           # Folder containing CIC-DDoS2019 CSV files
-OUTPUT_DIR = r"C:\Users\Admin\Documents\Cybersecurity_final\outputs"      # Folder to save models and results
+SAMPLE_PATH  = "./outputs/sample.csv"   # produced by sampler.py
+OUTPUT_DIR   = "./outputs"
 RANDOM_STATE = 42
 TEST_SIZE    = 0.2
-
-# Max rows kept per label class across the whole dataset.
-# 200,000 per class × 11 classes ≈ 2.2M rows total → ~3–4 GB RAM peak.
-# Raise to 500_000 if you want more data and have headroom.
-ROWS_PER_CLASS = 200_000
-
-# Rows read from disk per CSV chunk. 100k is safe for 16 GB RAM.
-CHUNKSIZE = 100_000
 
 os.makedirs(OUTPUT_DIR, exist_ok=True)
 np.random.seed(RANDOM_STATE)
@@ -51,241 +42,68 @@ np.random.seed(RANDOM_STATE)
 
 # =============================================================
 # STAGE 1 — DATA LOADING & PREPROCESSING
-# Two-pass streaming: no full DataFrame ever held in memory.
+# Loads the pre-sampled sample.csv produced by sampler.py.
 # =============================================================
 
-# Columns to drop regardless of dataset
 DROP_COLS = {"Flow ID", "Source IP", "Destination IP",
              "Source Port", "Destination Port", "Timestamp"}
 
 
-def get_csv_files(data_dir):
-    """Recursively find all CSVs and group by immediate parent folder."""
-    csv_files = glob.glob(os.path.join(data_dir, "**", "*.csv"), recursive=True)
-    csv_files += glob.glob(os.path.join(data_dir, "*.csv"))
-    csv_files = sorted(set(csv_files))
-
-    if not csv_files:
+def load_from_sample(sample_path):
+    """Load sample.csv, fit scaler + label encoder, save artifacts."""
+    if not os.path.exists(sample_path):
         raise FileNotFoundError(
-            f"No CSV files found in '{data_dir}' or its subdirectories.\n"
-            f"Expected structure:\n"
-            f"  {data_dir}\\\n"
-            f"    01-12\\  <-- Day 1 CSVs here\n"
-            f"    03-11\\  <-- Day 2 CSVs here"
+            f"sample.csv not found at '{sample_path}'.\n"
+            f"Run sampler.py first to generate it."
         )
 
-    folder_map = {}
-    for f in csv_files:
-        folder = os.path.basename(os.path.dirname(f))
-        folder_map.setdefault(folder, []).append(f)
+    print(f"[INFO] Loading sample from: {sample_path}")
+    df = pd.read_csv(sample_path, low_memory=False)
+    df.columns = df.columns.str.strip()
+    print(f"[INFO] Rows loaded: {len(df):,}")
 
-    print(f"[INFO] Found {len(csv_files)} CSV file(s) across all subdirectories:")
-    for folder, files in sorted(folder_map.items()):
-        print(f"  [{folder}]")
-        for f in files:
-            print(f"    - {os.path.basename(f)}")
+    label_col = next(
+        (c for c in df.columns if c.strip().lower() == "label"), None
+    )
+    if label_col is None:
+        raise ValueError("Label column not found in sample.csv.")
 
-    return csv_files, folder_map
+    df[label_col] = df[label_col].str.strip()
+    print(f"\n[INFO] Class distribution:")
+    print(df[label_col].value_counts().to_string())
 
+    feature_cols = [
+        c for c in df.columns
+        if c not in DROP_COLS
+        and c != label_col
+        and pd.api.types.is_numeric_dtype(df[c])
+    ]
 
-def stream_and_preprocess(data_dir):
-    """
-    Two-pass streaming pipeline — never holds more than one chunk in RAM.
+    df = df[[label_col] + feature_cols].replace([np.inf, -np.inf], np.nan).dropna()
+    print(f"[INFO] Rows after cleaning: {len(df):,}")
+    print(f"[INFO] Feature count: {len(feature_cols)}")
 
-    PASS 1: Scan every file to discover:
-            - Shared feature column names
-            - All class labels (to fit LabelEncoder)
-            - Per-column 99th-pct caps (to clip inf values)
-            - Label distribution per folder
-
-    PASS 2: Re-stream every file, clean each chunk on the fly,
-            reservoir-sample up to ROWS_PER_CLASS rows per label,
-            and accumulate only the final numpy arrays.
-    """
-
-    csv_files, folder_map = get_csv_files(data_dir)
-
-    # ------------------------------------------------------------------ #
-    # PASS 1 — discover schema, labels, column caps                       #
-    # ------------------------------------------------------------------ #
-    print("\n[PASS 1] Scanning files for schema, labels, and inf caps...")
-
-    all_labels          = set()
-    col_stats           = {}   # col -> list of per-chunk 99th-pct values
-    feature_cols        = None
-    label_col           = None
-    folder_label_counts = {}   # folder -> {label: count}
-
-    for folder, files in sorted(folder_map.items()):
-        folder_label_counts[folder] = {}
-        for f in files:
-            fname = os.path.basename(f)
-            try:
-                reader = pd.read_csv(f, low_memory=False,
-                                     chunksize=CHUNKSIZE, on_bad_lines="skip")
-                for chunk in reader:
-                    chunk.columns = chunk.columns.str.strip()
-
-                    # Detect label column once
-                    if label_col is None:
-                        label_col = next(
-                            (c for c in chunk.columns
-                             if c.strip().lower() == "label"), None
-                        )
-
-                    if label_col and label_col in chunk.columns:
-                        chunk[label_col] = chunk[label_col].str.strip()
-                        for lbl, cnt in chunk[label_col].value_counts().items():
-                            all_labels.add(lbl)
-                            folder_label_counts[folder][lbl] = (
-                                folder_label_counts[folder].get(lbl, 0) + cnt
-                            )
-
-                    # Agree on feature columns from first valid chunk
-                    if feature_cols is None and label_col:
-                        feature_cols = [
-                            c for c in chunk.columns
-                            if c not in DROP_COLS
-                            and c != label_col
-                            and pd.api.types.is_numeric_dtype(chunk[c])
-                        ]
-
-                    # Accumulate per-column 99th pct for clipping
-                    if feature_cols:
-                        num_chunk = chunk[
-                            [c for c in feature_cols if c in chunk.columns]
-                        ].replace([np.inf, -np.inf], np.nan)
-                        for col in num_chunk.columns:
-                            p99 = num_chunk[col].quantile(0.99)
-                            col_stats.setdefault(col, []).append(p99)
-
-            except Exception as e:
-                print(f"  [WARNING] Skipping {fname} in pass 1 — {e}")
-
-    if label_col is None or feature_cols is None:
-        raise ValueError("Could not detect label column or numeric features. "
-                         "Check your CSV files.")
-
-    # Per-column cap = median of per-chunk 99th percentiles
-    col_caps = {col: float(np.nanmedian(vals))
-                for col, vals in col_stats.items()}
-
-    # Print per-folder label breakdown
-    for folder, counts in folder_label_counts.items():
-        print(f"\n  Label breakdown for [{folder}]:")
-        for lbl, cnt in sorted(counts.items(), key=lambda x: -x[1]):
-            print(f"    {lbl:<30} {cnt:>10,}")
-
-    # Fit LabelEncoder on the full discovered label set
     le = LabelEncoder()
-    le.fit(sorted(all_labels))
-    print(f"\n[INFO] Classes found ({len(le.classes_)}): {list(le.classes_)}")
-    print(f"[INFO] Feature count  : {len(feature_cols)}")
-    print(f"[INFO] Rows-per-class : {ROWS_PER_CLASS:,}")
+    y  = le.fit_transform(df[label_col].values)
+    X  = df[feature_cols].values
 
-    # ------------------------------------------------------------------ #
-    # PASS 2 — stream, clean, sample, accumulate numpy arrays             #
-    # ------------------------------------------------------------------ #
-    print("\n[PASS 2] Streaming, cleaning, and sampling data...")
+    perm = np.random.permutation(len(X))
+    X, y = X[perm], y[perm]
 
-    # reservoir[label] = list of numpy arrays (rows of features)
-    reservoir        = {lbl: [] for lbl in le.classes_}
-    reservoir_counts = {lbl: 0  for lbl in le.classes_}
-    total_seen       = 0
-    total_dropped    = 0
-
-    for f in csv_files:
-        fname = os.path.basename(f)
-        try:
-            reader = pd.read_csv(f, low_memory=False,
-                                 chunksize=CHUNKSIZE, on_bad_lines="skip")
-            for chunk in reader:
-                chunk.columns = chunk.columns.str.strip()
-
-                if label_col not in chunk.columns:
-                    continue
-
-                # Only keep columns we know about
-                available = [c for c in feature_cols if c in chunk.columns]
-                if not available:
-                    continue
-
-                chunk[label_col] = chunk[label_col].str.strip()
-                before = len(chunk)
-                total_seen += before
-
-                # Clip inf → cap, drop NaN
-                sub = chunk[[label_col] + available].copy()
-                for col in available:
-                    sub[col] = (
-                        sub[col]
-                        .replace([np.inf, -np.inf], np.nan)
-                        .clip(upper=col_caps.get(col, np.nan))
-                    )
-                sub.dropna(inplace=True)
-                total_dropped += before - len(sub)
-
-                # Reservoir-sample per label
-                for lbl, grp in sub.groupby(label_col):
-                    if lbl not in reservoir:
-                        continue
-                    needed = ROWS_PER_CLASS - reservoir_counts[lbl]
-                    if needed <= 0:
-                        continue
-                    rows = grp[available].values
-                    if len(rows) > needed:
-                        idx  = np.random.choice(len(rows), needed, replace=False)
-                        rows = rows[idx]
-                    reservoir[lbl].append(rows)
-                    reservoir_counts[lbl] += len(rows)
-
-        except Exception as e:
-            print(f"  [WARNING] Skipping {fname} in pass 2 — {e}")
-
-    print(f"[INFO] Total rows scanned : {total_seen:,}")
-    print(f"[INFO] Rows dropped (NaN) : {total_dropped:,}")
-    print(f"[INFO] Rows kept per class:")
-    for lbl, cnt in reservoir_counts.items():
-        print(f"    {lbl:<30} {cnt:>8,}")
-
-    # Stack into final arrays
-    X_list, y_list = [], []
-    for lbl, arrays in reservoir.items():
-        if not arrays:
-            print(f"  [WARNING] No rows collected for class '{lbl}' — skipping.")
-            continue
-        X_block = np.vstack(arrays)
-        y_block = np.full(len(X_block),
-                          le.transform([lbl])[0], dtype=np.int64)
-        X_list.append(X_block)
-        y_list.append(y_block)
-
-    X_all = np.vstack(X_list)
-    y_all = np.concatenate(y_list)
-
-    # Shuffle combined array
-    perm  = np.random.permutation(len(X_all))
-    X_all = X_all[perm]
-    y_all = y_all[perm]
-
-    print(f"\n[INFO] Final dataset shape : {X_all.shape}")
-
-    # Scale
     print("[INFO] Fitting StandardScaler...")
     scaler   = StandardScaler()
-    X_scaled = scaler.fit_transform(X_all)
+    X_scaled = scaler.fit_transform(X)
 
-    # Save artifacts for Stage 3 / 4
     joblib.dump(scaler, os.path.join(OUTPUT_DIR, "scaler.pkl"))
     joblib.dump(le,     os.path.join(OUTPUT_DIR, "label_encoder.pkl"))
     pd.Series(feature_cols, name="feature").to_csv(
         os.path.join(OUTPUT_DIR, "feature_names.csv"), index=False
     )
     print("[INFO] Scaler, LabelEncoder, and feature names saved.")
-    print(f"[INFO] Classes encoded : "
+    print(f"[INFO] Classes encoded: "
           f"{dict(zip(le.classes_, le.transform(le.classes_)))}\n")
 
-    return X_scaled, y_all, le, feature_cols
+    return X_scaled, y, le, feature_cols
 
 
 def split_data(X, y):
@@ -528,7 +346,7 @@ if __name__ == "__main__":
     print("  STAGE 1 — DATA LOADING & PREPROCESSING")
     print("="*50 + "\n")
 
-    X, y, le, feature_names = stream_and_preprocess(DATA_DIR)
+    X, y, le, feature_names = load_from_sample(SAMPLE_PATH)
     X_train, X_test, y_train, y_test = split_data(X, y)
 
     # Free the full arrays — only train/test splits needed from here
