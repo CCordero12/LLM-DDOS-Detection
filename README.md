@@ -24,13 +24,16 @@ LLM augmentation improved accuracy by +2.12 pp and eliminated false alarms. CTGA
 ## Pipeline
 
 ```
-Stage 1 & 2  →  Stage 3 (LLM)  ──┐
-                Stage 3b (CTGAN) ──┤→  Stage 3c (combine)  →  Stage 4
+Stage 0 (sampler) ──┐
+                     ↓
+              Stage 1 & 2  →  Stage 3 (LLM)  ──┐
+                              Stage 3b (CTGAN) ──┤→  Stage 3c (combine)  →  Stage 4
 ```
 
 | Script | Stage | Description |
 |---|---|---|
-| `stage1_2_nids.py` | 1 & 2 | Load and preprocess CIC-DDoS2019; train baseline RF + XGBoost |
+| `sampler.py` | 0 | Load raw CIC-DDoS2019 CSVs; stratified-sample 500 rows/class → `sample.csv` |
+| `stage1_2_nids.py` | 1 & 2 | Load `sample.csv`; fit scaler + label encoder; train baseline RF + XGBoost |
 | `stage3_llm_generation.py` | 3 | Generate synthetic attack flows using Mistral-7B |
 | `stage3b_ctgan.py` | 3b | Generate synthetic flows using CTGAN |
 | `combine.py` | 3c | Merge real + synthetic into training sets; create held-out test set |
@@ -51,23 +54,31 @@ A CUDA-capable GPU is strongly recommended for Stage 3 (LLM generation). Stage 3
 
 ## How to Run
 
-### 1. Prepare the dataset
+### 1. Sample the dataset
 
-Download the [CIC-DDoS2019 dataset](https://www.unb.ca/cic/datasets/ddos-2019.html) and place the CSV files in a data directory.
+Download the [CIC-DDoS2019 dataset](https://www.unb.ca/cic/datasets/ddos-2019.html) and place the CSV files in a directory.
 
-Edit `DATA_DIR` and `OUTPUT_DIR` in `stage1_2_nids.py` to point to your paths, then run:
+Edit `DATA_DIR` in `sampler.py` to point to that directory, then run:
+
+```bash
+python sampler.py
+```
+
+This loads all raw CSVs, stratified-samples 500 rows per class, and saves `./outputs/sample.csv`. All downstream scripts read from this file.
+
+---
+
+### 2. Train baseline models
 
 ```bash
 python stage1_2_nids.py
 ```
 
-This produces preprocessed data, trained baseline models, and saves artifacts to `./outputs/`.
-
-> **Note:** The downstream stages (3, 3b, 3c, 4) expect a `sample.csv` in `./outputs/` — a stratified sample of 500 rows per class drawn from the full dataset. Create this from your preprocessed data before proceeding.
+Loads `sample.csv`, fits the scaler and label encoder, trains baseline RF and XGBoost, and saves all artifacts to `./outputs/`.
 
 ---
 
-### 2. Generate synthetic flows — LLM (Mistral-7B)
+### 3. Generate synthetic flows — LLM (Mistral-7B)
 
 ```bash
 python stage3_llm_generation.py
@@ -82,7 +93,7 @@ Configuration (edit at top of script):
 
 ---
 
-### 3. Generate synthetic flows — CTGAN
+### 4. Generate synthetic flows — CTGAN
 
 ```bash
 python stage3b_ctgan.py
@@ -92,7 +103,7 @@ Trains a Conditional Tabular GAN on real attack + benign flows and generates syn
 
 ---
 
-### 4. Combine real and synthetic data
+### 5. Combine real and synthetic data
 
 ```bash
 python combine.py
@@ -105,7 +116,7 @@ Splits real data 80/20 into train/test, appends synthetic flows to the training 
 
 ---
 
-### 5. Run baseline evaluation
+### 6. Run baseline evaluation
 
 ```bash
 python stage4_baseline.py
@@ -115,7 +126,7 @@ Trains RF and XGBoost on real data only and evaluates on `real_test.csv`. Saves 
 
 ---
 
-### 6. Run augmented evaluation
+### 7. Run augmented evaluation
 
 ```bash
 python stage4_train_eval.py
